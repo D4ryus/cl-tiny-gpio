@@ -26,4 +26,7 @@
            #:clear-bank-2
            #:set-bank-1
            #:set-bank-2
-           #:with-mem))
+           #:with-mem
+           #:read-dht22
+           #:retry-reading-sensor
+           #:use-last-read-value))

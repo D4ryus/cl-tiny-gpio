@@ -196,3 +196,105 @@
                            :protection '(:read :write)
                            :mmap '(:shared))
        ,@body)))
+
+(defun %read-dht22 (mem pin)
+  (let* ((pulses 40)
+         (probes (make-array pulses
+                             :element-type '(unsigned-byte 16)
+                             :initial-element 0
+                             :adjustable nil)))
+    (declare (type (unsigned-byte 8) pulses)
+             (type (simple-array (unsigned-byte 16) (*)) probes))
+    (labels ((wait-for-pin (high-p &optional (timeout 16000))
+               (declare (optimize (speed 3) (debug 0) (safety 0))
+                        (type fixnum timeout))
+               (loop :while (not (equal high-p (tiny-gpio:pin-read mem pin)))
+                     :for i :from 0
+                     :if (> i timeout)
+                     :do (error "Timeout on waiting for pin ~a"
+                                (if high-p "high" "low"))
+                     :finally (return (the fixnum i))))
+             (read-values ()
+               (declare (optimize (speed 3) (debug 0) (safety 0)))
+               ;; we can ignore the first two probes
+               (loop :repeat 2
+                     :do (wait-for-pin t)
+                         (wait-for-pin nil))
+               (loop :repeat 40
+                     :for pulse :from 0
+                     :do (locally (declare (type (unsigned-byte 8) pulse))
+                           (wait-for-pin t)
+                           (setf (aref probes pulse) (wait-for-pin nil)))))
+             (run-without-interrupts (thunk)
+               #+sbcl
+               (sb-sys:without-gcing
+                 (sb-sys:without-interrupts
+                   (funcall thunk)))
+               #-sbcl
+               (funcall thunk)))
+      #+sbcl
+      (sb-ext:gc)
+      (run-without-interrupts
+       (lambda ()
+         (tiny-gpio:pin-set-pull-up-down mem pin :off)
+         (tiny-gpio:pin-set-mode mem pin :out)
+         (tiny-gpio:pin-write mem pin nil)
+         (loop :with start := (get-internal-real-time)
+               :while (< (- (get-internal-real-time) start) 17))
+         (tiny-gpio:pin-set-mode mem pin :in)
+         (read-values)))
+      (let ((threshold (/ (reduce #'+ probes) (length probes)))
+            (data (make-array 5 :element-type '(unsigned-byte 8)
+                                :initial-element 0)))
+        (loop :for i :from 0
+              :for probe :across probes
+              :for offset := (floor i 8)
+              :do (setf (aref data offset)
+                        (logior (ash (aref data offset) 1)
+                                (if (> probe threshold) 1 0)))
+              :finally (return
+                         (let ((humidity
+                                 (/ (+ (* (aref data 0) 256)
+                                       (aref data 1))
+                                    10.0))
+                               (temp
+                                 (/ (+ (* (logand (aref data 2) #x7F) 256)
+                                       (aref data 3))
+                                    10.0)))
+                           (when (< 0 (logand #x80 (aref data 2)))
+                             (setf temp (- temp)))
+                           (unless (= (aref data 4)
+                                      (logand #xFF
+                                              (loop :for i :from 0 :to 3
+                                                    :sum (aref data i))))
+                             (error "Checksum check failed (humidity: ~a, temp: ~a)"
+                                    humidity temp))
+                           (cons humidity temp))))))))
+
+(defparameter *last-dht22-read* (cons 0 (cons 0.0 0.0)))
+(defun read-dht22 (pin &optional mem)
+  (if (not mem)
+      (tiny-gpio:with-mem (mem)
+        (read-dht22 pin mem))
+      (flet ((seconds ()
+               (/ (get-internal-real-time)
+                  internal-time-units-per-second)))
+        (loop :with started := (seconds)
+              :with retry-timeout := 3
+              :if (and *last-dht22-read*
+                       (< (- started (car *last-dht22-read*)) retry-timeout))
+              :do (return (cdr *last-dht22-read*))
+              :else
+              :do
+              (setf (car *last-dht22-read*) started)
+              (restart-case (let ((value (%read-dht22 mem pin)))
+                              (setf *last-dht22-read* (cons (seconds) value))
+                              (return value))
+                (retry-reading-sensor ()
+                  ;; we need to wait at least retry-timeout seconds
+                  ;; before trying again
+                  (loop :for left := (- retry-timeout (- (seconds) started))
+                        :while (> left 0)
+                        :do (sleep left)))
+                (use-last-read-value ()
+                  (return (cdr *last-dht22-read*))))))))
